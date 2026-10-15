@@ -146,5 +146,38 @@ def test_build_message_event_uses_channel_identity_for_channel_posts(telegram_ad
     assert event.source.user_id == "-1003950368353"
     assert event.source.user_name == "wzrd"
     assert event.platform_update_id == 12345
+    assert event.authenticated_sender is None, "channel/chat ID identities are not human senders"
+
+
+def _make_private_message(*, is_bot=False, sender_chat=None):
+    message = _make_channel_message("hi")
+    message.chat = SimpleNamespace(
+        id=123456789,
+        type="private",
+        title=None,
+        full_name="Alice",
+        is_forum=False,
+    )
+    message.from_user = SimpleNamespace(id=123456789, is_bot=is_bot, full_name="Alice")
+    message.sender_chat = sender_chat
+    return message
+
+
+def test_only_native_human_from_user_gets_adapter_provenance(telegram_adapter_cls):
+    from gateway.session import is_authenticated_inbound_sender
+
+    adapter = _make_adapter(telegram_adapter_cls)
+    human = adapter._build_message_event(_make_private_message(), MessageType.TEXT)
+    assert is_authenticated_inbound_sender(human.authenticated_sender)
+    assert human.authenticated_sender.platform == "telegram"
+    assert human.authenticated_sender.user_id == "123456789"
+
+    bot = adapter._build_message_event(_make_private_message(is_bot=True), MessageType.TEXT)
+    channel_sender = adapter._build_message_event(
+        _make_private_message(sender_chat=SimpleNamespace(id=-100123, title="channel")),
+        MessageType.TEXT,
+    )
+    assert bot.authenticated_sender is None
+    assert channel_sender.authenticated_sender is None
 
 

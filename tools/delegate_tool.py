@@ -196,6 +196,14 @@ def _apply_child_compression_cap(child, delegation_cfg: dict) -> None:
         cc._apply_threshold_tokens_cap()
 
 
+def _inherit_trusted_inbound_identity(parent_agent, child) -> None:
+    """Pass only a branded parent sender to an in-process delegated child."""
+    from gateway.session import is_authenticated_inbound_sender
+
+    identity = getattr(parent_agent, "_active_trusted_inbound_identity", None)
+    child._inherited_trusted_inbound_identity = identity if is_authenticated_inbound_sender(identity) else None
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -297,6 +305,7 @@ def _build_child_agent(
                     from hermes_state_registry import release_or_close
                     release_or_close(child_session_db)
             raise
+    _inherit_trusted_inbound_identity(parent_agent, child)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     _apply_child_cache_ttl(child)
     if child_session_db is not None:

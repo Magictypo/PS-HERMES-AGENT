@@ -116,6 +116,12 @@ class RemotePluginContext:
             raise AttributeError(f"'PluginContext' object has no attribute {name!r}")
         return functools.partial(self._runtime.ctx_call, self._plugin_key, name)
 
+    def get_invocation_context(self):
+        """Read the immutable context explicitly carried with this host invocation."""
+        from hermes_cli.plugin_invocation_context import current_tool_invocation_context
+
+        return current_tool_invocation_context()
+
     def on_unload(self, callback: Callable[[], Any]) -> None:
         if not callable(callback):
             raise TypeError("on_unload() callback must be callable")
@@ -213,7 +219,11 @@ class HostRuntime:
     def spawn(self, coro: Any, *, name: Optional[str] = None) -> Any:
         if not inspect.iscoroutine(coro):
             raise TypeError("spawn_task() requires a coroutine object")
-        return asyncio.run_coroutine_threadsafe(_on_behalf_of(coro, serving_request()), self.loop)
+        from hermes_cli.plugin_invocation_context import bind_tool_invocation_context
+
+        # Detached plugin work has no implicit authority from the user turn that spawned it.
+        with bind_tool_invocation_context(None):
+            return asyncio.run_coroutine_threadsafe(_on_behalf_of(coro, serving_request()), self.loop)
 
     # -- incoming ---------------------------------------------------------------------------------
     def handle(self, method: str, params: dict[str, Any], _origin: Optional[int]) -> Any:
@@ -336,7 +346,15 @@ class HostRuntime:
         if fn is None:
             raise LookupError(f"plugin host callable {ref} was released")
         args, kwargs = self._decode_args(params)
-        return self._encode_result(self.owners.get(ref, ""), self._run(fn(*args, **kwargs)))
+        from hermes_cli.plugin_invocation_context import ToolInvocationContext, bind_tool_invocation_context
+        raw_context = decode(params.get("invocation_context"), None)
+        try:
+            invocation_context = ToolInvocationContext(**dict(raw_context)) if raw_context is not None else None
+        except (TypeError, ValueError):
+            invocation_context = None
+        with bind_tool_invocation_context(invocation_context):
+            result = self._run(fn(*args, **kwargs))
+        return self._encode_result(self.owners.get(ref, ""), result)
 
     def op_obj_invoke(self, params: dict[str, Any]) -> Any:
         ref = int(params["ref"])

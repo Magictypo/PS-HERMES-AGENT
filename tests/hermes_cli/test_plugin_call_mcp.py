@@ -34,11 +34,12 @@ def _patch_handler(monkeypatch, response: str, captured: dict | None = None):
     """Replace tools.mcp_tool_handlers._make_tool_handler with a transport mock."""
     from tools import mcp_tool_handlers as _mcp_handlers
 
-    def _fake_make_handler(server_name, tool_name, tool_timeout):
+    def _fake_make_handler(server_name, tool_name, tool_timeout, **handler_options):
         if captured is not None:
             captured["server"] = server_name
             captured["tool"] = tool_name
             captured["timeout"] = tool_timeout
+            captured["handler_options"] = handler_options
 
         def _handler(args, **kwargs):
             if captured is not None:
@@ -128,7 +129,48 @@ def test_allowed_call_routes_through_existing_handler(monkeypatch):
     assert captured["server"] == "github"
     assert captured["tool"] == "create_issue"
     assert captured["args"] == {"title": "bug"}
+    assert captured["handler_options"] == {}, "legacy calls must not send a meta kwarg"
     assert result == {"ok": True, "result": "issue #7 created"}
+
+
+def test_authenticated_context_is_out_of_band_and_absent_by_default(monkeypatch):
+    from hermes_cli.plugin_invocation_context import ToolInvocationContext, bind_tool_invocation_context
+
+    _patch_config(monkeypatch, {"my-plugin": {"mcp_allowlist": ["prima"]}})
+    captured = {}
+    _patch_handler(monkeypatch, json.dumps({"result": "synthetic"}), captured)
+    ctx = _make_ctx()
+    assert ctx.get_invocation_context() is None
+    invocation = ToolInvocationContext(
+        platform="telegram", user_id="123456789", session_id="session-1",
+        turn_id="turn-1", task_id="task-1", tool_call_id="call-1",
+        session_key="telegram:123", parent_session_id="",
+    )
+    arguments = {"query": "coffee"}
+    metadata = invocation.to_mcp_metadata()
+
+    with bind_tool_invocation_context(invocation):
+        assert ctx.get_invocation_context() is invocation
+        result = ctx.call_mcp("prima", "search_products", arguments, metadata=metadata)
+
+    assert result == {"ok": True, "result": "synthetic"}
+    assert captured["args"] == arguments
+    assert captured["handler_options"] == {"metadata": metadata}
+    assert "user_id" not in captured["args"]
+    assert ctx.get_invocation_context() is None
+
+
+def test_metadata_factory_is_additive_and_mutually_exclusive(monkeypatch):
+    _patch_config(monkeypatch, {"my-plugin": {"mcp_allowlist": ["prima"]}})
+    captured = {}
+    _patch_handler(monkeypatch, '{"result":"ok"}', captured)
+    ctx = _make_ctx()
+    factory = lambda args: {"test": {"query": args["query"]}}
+    ctx.call_mcp("prima", "search_products", {"query": "tea"}, metadata_factory=factory)
+    assert captured["handler_options"] == {"metadata_factory": factory}
+
+    with pytest.raises(ValueError, match="either metadata or metadata_factory"):
+        ctx.call_mcp("prima", "search_products", {}, metadata={}, metadata_factory=factory)
 
 
 def test_error_result_maps_to_ok_false(monkeypatch):

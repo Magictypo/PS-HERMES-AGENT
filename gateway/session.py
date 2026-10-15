@@ -26,6 +26,41 @@ from hermes_state_keys import profile_from_session_key_namespace
 logger = logging.getLogger(__name__)
 
 
+_AUTHENTICATED_SENDER_SEAL = object()
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedInboundSender:
+    """Platform-adapter provenance for one native human sender event.
+
+    This process-local brand is intentionally not serializable as trusted
+    provenance. It is not a defense against malicious in-process plugin code.
+    """
+
+    platform: str = field(repr=False)
+    user_id: str = field(repr=False)
+    _seal: object = field(repr=False, compare=False)
+
+
+def authenticated_inbound_sender(platform: str, user_id: str, *, is_human: bool) -> Optional[AuthenticatedInboundSender]:
+    """Mint provenance only when a platform adapter has identified a native human sender."""
+    if is_human is not True or not isinstance(platform, str) or not platform or platform.strip() != platform:
+        return None
+    if not isinstance(user_id, str) or not user_id or user_id.strip() != user_id or len(user_id) > 512:
+        return None
+    return AuthenticatedInboundSender(platform, user_id, _AUTHENTICATED_SENDER_SEAL)
+
+
+def is_authenticated_inbound_sender(value: Any) -> bool:
+    """Recognize only process-local provenance objects minted by the adapter helper."""
+    return (
+        type(value) is AuthenticatedInboundSender
+        and value._seal is _AUTHENTICATED_SENDER_SEAL
+        and bool(value.platform)
+        and bool(value.user_id)
+    )
+
+
 # -- PII redaction helpers --------------------------------------------------------------------
 
 def _hash_id(value: str) -> str:

@@ -1698,6 +1698,14 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
             error_log="memory_manager.handle_tool_call raised for %s: %s",
         )
 
+    # Snapshot host-owned provenance before the dispatch crosses into the registry. Worker
+    # threads receive this immutable value explicitly; no ContextVar/env fallback is used.
+    from hermes_cli.plugin_invocation_context import build_tool_invocation_context
+    invocation_context = build_tool_invocation_context(
+        getattr(agent, "_active_trusted_inbound_identity", None), agent,
+        task_id=effective_task_id, tool_call_id=tool_call_id,
+    )
+
     # Registry tools: post hook is owned by this executor (inner observer suppressed).
     def _execute(next_args: dict) -> Any:
         import model_tools
@@ -1718,6 +1726,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 tool_request_middleware_trace=list(middleware_trace),
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                invocation_context=invocation_context,
             )
 
     return _SequentialDispatch(

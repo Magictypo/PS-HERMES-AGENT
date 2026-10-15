@@ -7092,6 +7092,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             user_id=(str(user.id) if user else (str(chat.id) if chat_type in {"dm", "channel"} else None)),
             user_name=user_name, thread_id=thread_id_str, chat_topic=chat_topic, message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False)
+        # Only Telegram's native from_user on a non-channel human message is a trusted sender.
+        # Chat IDs, sender_chat channel posts, and bot accounts are intentionally not promoted.
+        from gateway.session import authenticated_inbound_sender
+        authenticated_sender = authenticated_inbound_sender(
+            "telegram", str(user.id) if user is not None else "",
+            is_human=(user is not None and getattr(message, "sender_chat", None) is None
+                      and chat_type != "channel" and getattr(user, "is_bot", None) is False),
+        )
         reply_to_id, reply_to_text = self._reply_context(message)
         from gateway.platforms.base import resolve_channel_prompt  # per-channel/topic ephemeral prompt
         from plugins.platforms.telegram.telegram_context import group_identity_prompt
@@ -7102,7 +7110,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             message_id=str(message.message_id), platform_update_id=update_id,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
             channel_prompt=group_identity_prompt(self, message, channel_prompt),
-            timestamp=message.date)
+            timestamp=message.date, authenticated_sender=authenticated_sender)
 
     # -- Message reactions (processing lifecycle) --
 

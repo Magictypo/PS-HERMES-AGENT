@@ -10,7 +10,8 @@ import time
 from contextlib import asynccontextmanager
 from functools import partial
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from types import MappingProxyType
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from hermes_platform import declaration
 from tools.registry import invalidate_check_fn_cache, tool_error
@@ -379,7 +380,7 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
             inflight.discard(task)
 
 
-async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict):
+async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict, *, meta=None):
     """``session.call_tool`` that fails fast when the stdio child is/gets dead: pre-call (a dead
     child must not hold the slot for the full timeout) and mid-call (race against
     ``_watch_stdio_children``). Both raise :class:`_StdioChildExited` for the respawn path, which
@@ -393,7 +394,10 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
             f"MCP stdio subprocess for '{server_name}' had already exited when the call was dispatched",
             in_flight=False,
         )
-    _call_coro = server.session.call_tool(tool_name, arguments=args)
+    call_kwargs = {"arguments": args}
+    if meta is not None:
+        call_kwargs["meta"] = meta
+    _call_coro = server.session.call_tool(tool_name, **call_kwargs)
     _watch_children = getattr(server, "_watch_stdio_children", None)
     if not (inspect.iscoroutinefunction(_watch_children) and asyncio.iscoroutine(_call_coro)):
         # Stubbed sessions return a non-awaitable, or there is no child-watcher to race: plain await.
@@ -563,14 +567,48 @@ def _render_call_tool_result(result, server_name: str, image_paths: Optional[lis
         return json.dumps({"result": text_result}, ensure_ascii=False)
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *, native_images: bool = False):
+def _snapshot_mcp_mapping(value: Any, label: str) -> dict:
+    """Copy one JSON-compatible MCP object before a transport attempt."""
+    if type(value) is not dict:
+        raise TypeError(f"MCP {label} must be a plain object")
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        copied = json.loads(encoded)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"MCP {label} must contain JSON values") from exc
+    if type(copied) is not dict:
+        raise TypeError(f"MCP {label} must be a plain object")
+    return copied
+
+
+def _freeze_mcp_value(value):
+    """Recursively make the retry factory's copy read-only."""
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_mcp_value(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_mcp_value(item) for item in value)
+    return value
+
+
+def _make_tool_handler(
+    server_name: str, tool_name: str, tool_timeout: float, *, native_images: bool = False,
+    metadata: Optional[dict] = None,
+    metadata_factory: Optional[Callable[[Mapping[str, Any]], dict[str, Any]]] = None,
+):
     """Sync handler (``handler(args_dict, **kwargs)``) calling an MCP tool via the background loop. Always a JSON
     string, except with ``native_images`` (the registry handler the agent loop dispatches): a result carrying
     images then becomes the ``_multimodal`` envelope when the active route takes images in tool results.
     Direct callers (plugins' ``ctx.call_mcp``) keep the string contract and the ``MEDIA:`` paths."""
     op = f"tools/call {tool_name}"
+    if metadata is not None and metadata_factory is not None:
+        raise ValueError("Pass either metadata or metadata_factory, not both")
+    if metadata_factory is not None and not callable(metadata_factory):
+        raise TypeError("metadata_factory must be callable")
+    static_meta = _snapshot_mcp_mapping(metadata, "metadata") if metadata is not None else None
 
     def _handler(args: dict, **kwargs) -> Any:
+        # Snapshot once so caller mutation cannot change a retried request.
+        argument_snapshot = _snapshot_mcp_mapping(args, "arguments") if metadata_factory is not None else None
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:
@@ -587,7 +625,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
-                    result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
+                    if metadata_factory is not None:
+                        factory_args = _freeze_mcp_value(_snapshot_mcp_mapping(argument_snapshot, "arguments"))
+                        attempt_args = _snapshot_mcp_mapping(argument_snapshot, "arguments")
+                        attempt_meta = _snapshot_mcp_mapping(metadata_factory(factory_args), "metadata")
+                    else:
+                        attempt_args = args
+                        attempt_meta = _snapshot_mcp_mapping(static_meta, "metadata") if static_meta is not None else None
+                    result = await _call_tool_racing_stdio_death(
+                        server, server_name, tool_name, attempt_args, meta=attempt_meta)
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy

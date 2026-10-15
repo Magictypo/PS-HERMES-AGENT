@@ -827,6 +827,76 @@ class TestToolHandler:
             _servers.pop("test_srv", None)
 
 
+    def test_metadata_is_out_of_band_and_static_metadata_is_copied(self):
+        from tools.mcp_tool_handlers import _make_tool_handler
+        from tools.mcp_tool import _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(return_value=_make_call_result("ok", is_error=False))
+        server = _make_mock_server("meta_srv", session=mock_session)
+        _servers["meta_srv"] = server
+        metadata = {"hermes.dev/context": {"user_id": "123", "turn_id": "turn-1"}}
+        handler = _make_tool_handler("meta_srv", "search", 120, metadata=metadata)
+        metadata["hermes.dev/context"]["user_id"] = "forged"
+        arguments = {"query": "coffee"}
+        try:
+            with self._patch_mcp_loop():
+                handler(arguments)
+            mock_session.call_tool.assert_called_once_with(
+                "search", arguments=arguments,
+                meta={"hermes.dev/context": {"user_id": "123", "turn_id": "turn-1"}},
+            )
+        finally:
+            _servers.pop("meta_srv", None)
+
+    def test_metadata_factory_runs_per_retry_with_fresh_immutable_argument_snapshot(self):
+        from tools.mcp_tool_handlers import _make_tool_handler
+        from tools.mcp_tool import _servers
+        from collections.abc import Mapping
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(side_effect=[
+            _make_call_result("first", is_error=False),
+            _make_call_result("second", is_error=False),
+        ])
+        server = _make_mock_server("retry_meta_srv", session=mock_session)
+        _servers["retry_meta_srv"] = server
+        factory_inputs = []
+
+        def factory(snapshot):
+            assert isinstance(snapshot, Mapping)
+            with pytest.raises(TypeError):
+                snapshot["query"] = "forged"
+            with pytest.raises(TypeError):
+                snapshot["nested"]["page"] = 99
+            factory_inputs.append(dict(snapshot))
+            return {"assertion": f"attempt-{len(factory_inputs)}"}
+
+        def retry_twice(_name, _server, _op, call_attempt, _timeout, _recoverers, _failure, **_kwargs):
+            async def attempts():
+                first = await call_attempt()
+                assert json.loads(first)["result"] == "first"
+                arguments["query"] = "mutated after first physical attempt"
+                return await call_attempt()
+            return asyncio.run(attempts())
+
+        arguments = {"query": "tea", "nested": {"page": 1}}
+        handler = _make_tool_handler("retry_meta_srv", "search", 120, metadata_factory=factory)
+        try:
+            with patch("tools.mcp_tool_handlers._dispatch", side_effect=retry_twice):
+                result = handler(arguments)
+            assert json.loads(result)["result"] == "second"
+            assert [item["query"] for item in factory_inputs] == ["tea", "tea"]
+            assert [item["nested"]["page"] for item in factory_inputs] == [1, 1]
+            assert [entry.kwargs["meta"] for entry in mock_session.call_tool.await_args_list] == [
+                {"assertion": "attempt-1"}, {"assertion": "attempt-2"},
+            ]
+            assert [entry.kwargs["arguments"]["query"] for entry in mock_session.call_tool.await_args_list] == [
+                "tea", "tea",
+            ]
+        finally:
+            _servers.pop("retry_meta_srv", None)
+
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool_handlers import _make_tool_handler
         from tools.mcp_tool import _servers

@@ -799,6 +799,55 @@ def register(ctx):
 
 The dispatched tool goes through the normal approval, redaction, and budget pipelines — it's a real tool invocation, not a shortcut around them.
 
+### Trusted per-tool invocation context and MCP metadata
+
+A general plugin tool handler can call `ctx.get_invocation_context()` to read an immutable
+`ToolInvocationContext` for the actual current invocation. The result is `None` unless a live
+platform adapter attached native human-sender provenance to the accepted event and Hermes carried
+it through that turn and tool call. CLI, cron, restored-session, synthetic, bot, non-human, and
+ambiguous adapter events do not gain identity from `AIAgent._user_id`, the transcript, tool
+arguments, or the environment. Delegated in-process children inherit only an already-branded parent
+sender; children with no such parent context remain unbound.
+
+```python
+import json
+
+def register(ctx):
+    def search_products(arguments, **_kwargs):
+        invocation = ctx.get_invocation_context()
+        if invocation is None:
+            return json.dumps({"error": "Authenticated human invocation context required"})
+        result = ctx.call_mcp(
+            "prima", "search_products", arguments,
+            metadata=invocation.to_mcp_metadata(),
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    ctx.register_tool(
+        name="prima_search_products", toolset="prima", schema=..., handler=search_products,
+    )
+```
+
+`ToolInvocationContext.to_mcp_metadata()` returns a generic, namespaced MCP metadata object. Hermes
+sends it through the MCP request's out-of-band `_meta`; it is never merged into `arguments`. The
+carrier is **not a signature or authorization decision**. A receiving service must authenticate the
+MCP transport, resolve the active external binding, and apply its own current authorization policy.
+A plugin must stop if the context is `None`; it must not reconstruct identity from prompt text or
+model-controlled arguments.
+
+`ctx.call_mcp(..., metadata=...)` reuses static metadata across retries. For a backend that requires a
+fresh one-use assertion per physical retry, pass `metadata_factory=lambda arguments: ...`; Hermes
+calls the synchronous factory with the same JSON argument snapshot for each actual attempt, then
+sends its result as `_meta`. The default/no-metadata call remains unchanged. Context is bound to each
+Hermes tool worker and cleaned up on success or exception. A plugin-created thread receives no
+ambient identity; capture the immutable context in the handler and pass it explicitly to that
+thread. Plugin-host mode carries the context only with the active tool invocation, not through
+arbitrary detached work.
+
+The plugin context is a host-to-plugin extension, not an OS sandbox against malicious code running
+with the same account. Keep signer keys, backend credentials, binding resolution, and business
+permissions on the protected backend.
+
 ### Store settings and runtime state
 
 Use plugin-relative config keys for user-visible behavior. Hermes resolves them

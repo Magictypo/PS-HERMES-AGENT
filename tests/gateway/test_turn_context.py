@@ -30,6 +30,16 @@ def _make_runner(ctx):
 
 
 class TestTurnContext:
+    def test_trusted_identity_does_not_shift_existing_positional_fields(self):
+        source = object()
+        identity = object()
+        context = TurnContext(source, True, True, trusted_inbound_identity=identity)
+
+        assert context.source is source
+        assert context.reply_expected is True
+        assert context.scheduled_heartbeat is True
+        assert context.trusted_inbound_identity is identity
+
     def test_defaults_are_independent_containers(self):
         a, b = TurnContext(), TurnContext()
         a.last_progress_msg[0] = "x"

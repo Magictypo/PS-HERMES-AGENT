@@ -11,6 +11,187 @@ import pytest
 from hermes_cli import plugins as plugins_mod
 from hermes_cli.plugins import PluginManager
 
+def test_plugin_host_wire_round_trips_read_only_mappings_without_accepting_arbitrary_mappings():
+    from collections import UserDict
+    from types import MappingProxyType
+
+    from hermes_cli.plugin_host_wire import Opaque, decode, encode
+
+    decoded = decode(encode(MappingProxyType({"nested": MappingProxyType({"value": "safe"})})))
+    assert isinstance(decoded, MappingProxyType)
+    assert isinstance(decoded["nested"], MappingProxyType)
+    assert decoded["nested"]["value"] == "safe"
+    with pytest.raises(TypeError):
+        decoded["new"] = "value"
+    with pytest.raises(TypeError):
+        decoded["nested"]["value"] = "changed"
+
+    assert isinstance(decode(encode(UserDict({"value": "unsupported"}))), Opaque)
+
+
+def test_host_metadata_factory_callback_retries_with_read_only_argument_snapshots(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from model_tools import handle_function_call
+    from tools.mcp_tool import MCPServerTask, _servers
+
+    plugin = '''
+import json
+from collections.abc import Mapping
+
+def register(ctx):
+    attempts = []
+    def metadata_factory(snapshot):
+        assert isinstance(snapshot, Mapping)
+        try:
+            snapshot["query"] = "forged"
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("top-level metadata factory snapshot was mutable")
+        try:
+            snapshot["nested"]["page"] = 99
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("nested metadata factory snapshot was mutable")
+        attempts.append([snapshot["query"], snapshot["nested"]["page"]])
+        return {"assertion": f"attempt-{len(attempts)}"}
+
+    def call_mcp(args, **_kwargs):
+        result = ctx.call_mcp("retry_meta_srv", "search", args, metadata_factory=metadata_factory)
+        return json.dumps({"response": result, "factory_inputs": attempts})
+
+    ctx.register_tool(name="host_mcp_retry_probe", toolset="hostmcp",
+        schema={"name": "host_mcp_retry_probe", "description": "d",
+                "parameters": {"type": "object", "properties": {}}}, handler=call_mcp)
+'''
+    home = _home_with_plugins(tmp_path, monkeypatch, {"hostmcp": plugin})
+    config_path = home / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["plugins"].setdefault("entries", {})["hostmcp"] = {
+        "mcp_allowlist": ["retry_meta_srv"],
+    }
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    mock_session = SimpleNamespace(
+        call_tool=AsyncMock(side_effect=[
+            SimpleNamespace(content=[SimpleNamespace(text="first")], isError=False),
+            SimpleNamespace(content=[SimpleNamespace(text="second")], isError=False),
+        ])
+    )
+    server = MCPServerTask("retry_meta_srv")
+    server.session = mock_session
+    server._tools = []
+    _servers["retry_meta_srv"] = server
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    def retry_twice(_name, _server, _op, call_attempt, _timeout, _recoverers, _failure, **_kwargs):
+        async def attempts():
+            first = await call_attempt()
+            assert json.loads(first)["result"] == "first"
+            return await call_attempt()
+        return asyncio.run(attempts())
+
+    try:
+        assert manager._plugins["hostmcp"].error is None
+        with patch("tools.mcp_tool_handlers._dispatch", side_effect=retry_twice):
+            raw = handle_function_call(
+                "host_mcp_retry_probe", {"query": "tea", "nested": {"page": 1}},
+                task_id="task-1", skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
+            )
+        assert json.loads(raw) == {
+            "response": {"ok": True, "result": "second"},
+            "factory_inputs": [["tea", 1], ["tea", 1]],
+        }
+        assert [entry.kwargs["meta"] for entry in mock_session.call_tool.await_args_list] == [
+            {"assertion": "attempt-1"}, {"assertion": "attempt-2"},
+        ]
+        assert [entry.kwargs["arguments"] for entry in mock_session.call_tool.await_args_list] == [
+            {"query": "tea", "nested": {"page": 1}},
+            {"query": "tea", "nested": {"page": 1}},
+        ]
+    finally:
+        _servers.pop("retry_meta_srv", None)
+        manager.unload()
+        manager._plugin_host().shutdown()
+
+
+def test_host_plugin_receives_only_the_current_tool_invocation_context(tmp_path, monkeypatch):
+    from hermes_cli.plugin_invocation_context import ToolInvocationContext
+    from model_tools import handle_function_call
+
+    plugin = '''
+import json
+import asyncio
+
+def register(ctx):
+    async def inspect_invocation(args, **_kwargs):
+        await asyncio.sleep(0)
+        value = ctx.get_invocation_context()
+        return json.dumps({
+            "user_id": value.user_id if value else None,
+            "session_id": value.session_id if value else None,
+            "tool_call_id": value.tool_call_id if value else None,
+        })
+    async def inspect_detached(_args, **_kwargs):
+        async def read_context():
+            await asyncio.sleep(0)
+            value = ctx.get_invocation_context()
+            return value.user_id if value else None
+        future = ctx.spawn_task(read_context())
+        return json.dumps({"user_id": await asyncio.wrap_future(future)})
+    ctx.register_tool(name="host_context_probe", toolset="hostcontext",
+        schema={"name": "host_context_probe", "description": "d",
+                "parameters": {"type": "object", "properties": {}}},
+        handler=inspect_invocation, is_async=True)
+    ctx.register_tool(name="host_detached_probe", toolset="hostcontext",
+        schema={"name": "host_detached_probe", "description": "d",
+                "parameters": {"type": "object", "properties": {}}},
+        handler=inspect_detached, is_async=True)
+'''
+    _home_with_plugins(tmp_path, monkeypatch, {"hostcontext": plugin})
+    manager = PluginManager()
+    manager.discover_and_load()
+    invocation = ToolInvocationContext(
+        platform="telegram", user_id="555555", session_id="shared-session",
+        turn_id="turn-1", task_id="task-1", tool_call_id="call-1",
+        session_key="telegram:shared", parent_session_id="",
+    )
+    try:
+        assert manager._plugins["hostcontext"].error is None
+        result = json.loads(handle_function_call(
+            "host_context_probe", {"user_id": "model-forged"}, task_id="task-1",
+            tool_call_id="call-1", session_id="shared-session", turn_id="turn-1",
+            invocation_context=invocation, skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
+        ))
+        assert result == {
+            "user_id": "555555", "session_id": "shared-session", "tool_call_id": "call-1",
+        }
+        detached = json.loads(handle_function_call(
+            "host_detached_probe", {}, task_id="task-1", tool_call_id="call-detached",
+            session_id="shared-session", turn_id="turn-1", invocation_context=invocation,
+            skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        ))
+        assert detached == {"user_id": None}, "detached host work must not inherit user authority"
+        missing = json.loads(handle_function_call(
+            "host_context_probe", {"user_id": "555555"}, task_id="task-2",
+            tool_call_id="call-2", session_id="shared-session", turn_id="turn-2",
+            invocation_context=None, skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
+        ))
+        assert missing == {"user_id": None, "session_id": None, "tool_call_id": None}
+    finally:
+        manager.unload()
+        manager._plugin_host().shutdown()
+
+
 PROBE_PLUGIN = '''
 import json, os
 from agent.image_gen_provider import ImageGenProvider

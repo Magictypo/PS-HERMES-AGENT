@@ -897,6 +897,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
+            if _accepts_keyword(agent.run_conversation, "trusted_inbound_identity"):
+                kwargs["trusted_inbound_identity"] = ctx.trusted_inbound_identity
             from gateway.session_api_turn import api_execution
             api = api_execution.get()
             if api is not None and api.get('relay_metadata') and _accepts_keyword(agent.run_conversation, "relay_metadata"):

@@ -26,6 +26,7 @@ import logging
 import threading
 from concurrent.futures import Future
 from pathlib import PurePath
+from types import MappingProxyType
 from typing import Any, BinaryIO, Callable, Dict, Optional
 
 logger = logging.getLogger("hermes_cli.plugins")
@@ -106,6 +107,10 @@ def encode(value: Any, refs: Optional[Callable[[Any], Optional[dict]]] = None, _
         return str(value)
     if isinstance(value, (bytes, bytearray)):
         return {"__bytes__": base64.b64encode(bytes(value)).decode("ascii")}
+    if isinstance(value, MappingProxyType):
+        return {"__readonly_mapping__": {
+            str(k): encode(v, refs, _depth + 1) for k, v in value.items()
+        }}
     if isinstance(value, dict):
         return {str(k): encode(v, refs, _depth + 1) for k, v in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -140,6 +145,9 @@ def decode(value: Any, resolve: Optional[Callable[[dict], Any]] = None) -> Any:
         return value
     if "__record__" in value:
         return Record(decode(value.get("fields") or {}, resolve))
+    readonly_mapping = value.get("__readonly_mapping__")
+    if set(value) == {"__readonly_mapping__"} and type(readonly_mapping) is dict:
+        return MappingProxyType({key: decode(item, resolve) for key, item in readonly_mapping.items()})
     if "__bytes__" in value:
         return base64.b64decode(value["__bytes__"])
     if "__opaque__" in value:

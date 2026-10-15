@@ -281,6 +281,10 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                trusted_inbound_identity=(
+                    getattr(event, "authenticated_sender", None)
+                    if not bool(getattr(event, "internal", False)) else None
+                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 

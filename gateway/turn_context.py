@@ -100,3 +100,5 @@ class TurnContext:
     _native_slack_task_cards: bool = False
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None
+    # Ephemeral provenance from the accepted live platform event; never reloaded from session history.
+    trusted_inbound_identity: Any = None

@@ -30,6 +30,7 @@ class TurnFacadeMixin:
         relay_metadata: Optional[dict[str, Any]] = None,
         title_user_message: Optional[str]=None,
         prelude: Optional[Generator]=None,
+        trusted_inbound_identity: Any = None,
     ) -> dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review shares this session_id for cache parity: fence review startup or interrupt
@@ -52,6 +53,7 @@ class TurnFacadeMixin:
         from agent.relay_cwd import resolve_relay_scope_cwds
         from agent.review_idle_queue import QUEUE as _review_queue
         from agent.subagent_lifecycle import bind_subagent_parent
+        from hermes_cli.plugin_invocation_context import bind_agent_trusted_identity
         from agent.interrupt_scope import track_in_interrupt_scope
         from agent.turn_facade_lease import admit_durable_turn_lease, carry_unadmitted_user_message
         from hermes_cli.observability.relay_shared_metrics import finish_task_run, start_task_run
@@ -64,6 +66,8 @@ class TurnFacadeMixin:
             "platform": getattr(self, "platform", None) or "",
         }
         relay_turn_id = f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+        missing_current_turn_id = object()
+        previous_current_turn_id = getattr(self, "_current_turn_id", missing_current_turn_id)
         self._relay_pending_turn_id = relay_turn_id
         relay_parent_session_id = (
             str(getattr(self, "_parent_session_id", None) or "")
@@ -141,7 +145,8 @@ class TurnFacadeMixin:
 
             # Keep the ContextVar scope local (agent tokens may be observed from another thread).
             # A host that owns this thread (Hermes Console) may cancel the turn cross-thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self):
+            self._current_turn_id = relay_turn_id
+            with bind_agent_trusted_identity(self, trusted_inbound_identity), bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self):
                 try:
                     if lease is not None:
                         lease.start()
@@ -201,6 +206,12 @@ class TurnFacadeMixin:
                         lease.join_threads()
                         lease.clear_interrupt()  # refresher interrupt between stop and join; AFTER join
                         lease.release()
+                    # Turn metadata is ephemeral and agent instances can be reused.
+                    if previous_current_turn_id is missing_current_turn_id:
+                        with suppress(AttributeError):
+                            delattr(self, "_current_turn_id")
+                    else:
+                        self._current_turn_id = previous_current_turn_id
                     # Always clear mid-turn labels on exit — including interrupted early returns
                     # that skip finalize_turn. Keep ts.
                     with suppress(Exception):

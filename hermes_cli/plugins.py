@@ -245,6 +245,16 @@ class PluginContext:
         """Return the effective registry id used for this plugin's namespaces."""
         return manifest_key(self.manifest)
 
+    def get_invocation_context(self):
+        """Return this actual tool call's immutable, host-owned invocation context, or None.
+
+        The value exists only while an authenticated inbound tool invocation is
+        executing. There is no environment, transcript, or model-argument fallback.
+        """
+        from hermes_cli.plugin_invocation_context import current_tool_invocation_context
+
+        return current_tool_invocation_context()
+
     def has_plugin(self, plugin_id: str) -> bool:
         """Return True when another plugin is loaded and enabled (runtime probe for advisory
         ``requires_plugins``, #64165). Matches on registry key or manifest name."""
@@ -506,12 +516,17 @@ class PluginContext:
 
     def call_mcp(
         self, server: str, tool: str, arguments: Optional[dict[str, Any]] = None,
-        timeout: float = 30,
+        timeout: float = 30, *, metadata: Optional[dict[str, Any]] = None,
+        metadata_factory: Optional[Callable[[Mapping[str, Any]], dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """Call ``tool`` on MCP ``server`` synchronously through :mod:`tools.mcp_tool`'s native client
         (same trust gates, breaker, reconnect — never a parallel connection). Servers not in
         ``plugins.entries.<plugin_id>.mcp_allowlist`` raise ``PermissionError`` (default-deny). ``timeout``
-        clamps to 1–600s; results over ~64KB are truncated with a marker.
+        clamps to 1–600s; results over ~64KB are truncated with a marker. ``metadata`` (or
+        ``metadata_factory``) is sent through MCP's out-of-band ``_meta`` field, never merged into
+        model arguments. The factory receives a frozen-by-copy argument snapshot and runs once for
+        each physical attempt; use it when each retry needs a fresh one-use assertion. A static
+        metadata object is reused across retries.
 
         This is a per-server grant, deliberately not ambient authority over every configured server.
         TODO(#64228): swap the per-server allowlist for the declared capability model once it lands
@@ -524,13 +539,22 @@ class PluginContext:
                 f"plugins.entries.{self.plugin_id}.mcp_allowlist in config.yaml "
                 f"to grant access (default is no MCP access)."
             )
+        if metadata is not None and metadata_factory is not None:
+            raise ValueError("Pass either metadata or metadata_factory, not both")
+        if metadata_factory is not None and not callable(metadata_factory):
+            raise TypeError("metadata_factory must be callable")
         try:
             timeout = float(timeout)
         except (TypeError, ValueError):
             timeout = 30.0
         timeout = max(1.0, min(timeout, 600.0))
         from tools.mcp_tool_handlers import _make_tool_handler
-        raw = _make_tool_handler(server, tool, timeout)(dict(arguments or {}))
+        handler_options = {}
+        if metadata is not None:
+            handler_options["metadata"] = metadata
+        if metadata_factory is not None:
+            handler_options["metadata_factory"] = metadata_factory
+        raw = _make_tool_handler(server, tool, timeout, **handler_options)(dict(arguments or {}))
         logger.debug("Plugin %s called MCP %s/%s (timeout=%ss, %d chars returned)",
                      self.manifest.name, server, tool, timeout, len(raw or ""))
         return self._mcp_envelope(raw)

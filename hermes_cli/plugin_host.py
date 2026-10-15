@@ -324,8 +324,13 @@ class PluginHost:
             self._releases.append(ref)
 
     def invoke(self, ref: int, args: tuple, kwargs: dict, *, generation: Optional[int] = None) -> Any:
-        return self._call("invoke", {"ref": ref, "args": encode(list(args)), "kwargs": encode(kwargs)},
-                          generation=generation)
+        from hermes_cli.plugin_invocation_context import current_tool_invocation_context
+
+        params = {"ref": ref, "args": encode(list(args)), "kwargs": encode(kwargs)}
+        context = current_tool_invocation_context()
+        if context is not None:
+            params["invocation_context"] = encode(context)
+        return self._call("invoke", params, generation=generation)
 
     def obj_invoke(self, slot: _ObjectSlot, method: str, args: tuple, kwargs: dict) -> Any:
         ref, generation = slot.live()
