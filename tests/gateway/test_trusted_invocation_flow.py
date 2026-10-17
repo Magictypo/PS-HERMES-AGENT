@@ -145,3 +145,90 @@ def test_turn_runner_and_agent_facade_bind_and_restore_live_sender(monkeypatch):
         runner._run_conversation_with_approval(agent, [], None, None, None)
     assert agent._current_turn_id == "previous-turn"
     assert not hasattr(agent, "_active_trusted_inbound_identity")
+
+
+@pytest.mark.asyncio
+async def test_run_agent_wrapper_passes_trusted_identity_to_inner_signature(monkeypatch):
+    import inspect
+    from gateway.run import GatewayRunner
+
+    identity = authenticated_inbound_sender("telegram", "555555", is_human=True)
+    runner = object.__new__(GatewayRunner)
+    monkeypatch.setattr(runner, "_profile_scope_for_source", lambda _source: nullcontext())
+    received = {}
+
+    async def invoke_real_inner_signature(message, context_prompt, history, source, session_id, **kwargs):
+        bound = inspect.signature(GatewayRunner._run_agent_inner).bind(
+            runner, message, context_prompt, history, source, session_id, **kwargs,
+        )
+        received.update(bound.arguments)
+        return {"final_response": "ok"}
+
+    monkeypatch.setattr(runner, "_run_agent_inner", invoke_real_inner_signature)
+    result = await runner._run_agent(
+        "hello", "", [], SimpleNamespace(), "session-1",
+        trusted_inbound_identity=identity,
+    )
+
+    assert result["final_response"] == "ok"
+    assert received["trusted_inbound_identity"] is identity
+
+
+@pytest.mark.parametrize("identity_kind", ["missing", "forged", "mismatch", "internal"])
+def test_durable_native_queue_restores_only_live_branded_sender(identity_kind):
+    """Native queue serialization strips trust; only the same-process admitted FIFO row may restore it."""
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from gateway.session_ingress import restore_live_native_sender
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", user_id="12345")
+    event = MessageEvent(text="list products", source=source)
+    if identity_kind == "missing":
+        sender = None
+    elif identity_kind == "forged":
+        sender = SimpleNamespace(platform="telegram", user_id="12345")
+    elif identity_kind == "mismatch":
+        sender = authenticated_inbound_sender("telegram", "99999", is_human=True)
+    else:
+        sender = authenticated_inbound_sender("telegram", "12345", is_human=True)
+        event.internal = True
+
+    authority = SimpleNamespace(native_sender_identities={"admission-1": sender})
+    restored = restore_live_native_sender(authority, event, "admission-1")
+    assert restored is event
+    assert getattr(restored, "authenticated_sender", None) is None
+    assert authority.native_sender_identities == {}
+
+
+def test_committed_native_admission_keeps_exact_live_identity_out_of_durable_payload():
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from gateway.session_authority import SessionAuthority
+    from gateway.session_ingress import restore_live_native_sender
+
+    authority = object.__new__(SessionAuthority)
+    authority.native_sender_identities = {}
+    authority._publish_pending = lambda _ref: None
+    authority._receipt = lambda row: row
+    sender_a = authenticated_inbound_sender("telegram", "111", is_human=True)
+    sender_b = authenticated_inbound_sender("telegram", "222", is_human=True)
+    source_a = SessionSource(platform=Platform.TELEGRAM, chat_id="shared", user_id="111")
+    source_b = SessionSource(platform=Platform.TELEGRAM, chat_id="shared", user_id="222")
+    event_a = MessageEvent(text="a", source=source_a, authenticated_sender=sender_a)
+    event_b = MessageEvent(text="b", source=source_b, authenticated_sender=sender_b)
+
+    SessionAuthority._admitted(authority, "ref", event_a, {"admission_id": "admission-a", "status": "queued"})
+    SessionAuthority._admitted(authority, "ref", event_b, {"admission_id": "admission-b", "status": "queued"})
+    assert set(authority.native_sender_identities) == {"admission-a", "admission-b"}
+
+    # These events represent source reconstructed from durable native envelopes, whose
+    # authenticated_sender field is intentionally absent. The process-local admission IDs
+    # reattach only their own brands and consume both slots exactly once.
+    restored_a = MessageEvent(text="a", source=source_a)
+    restored_b = MessageEvent(text="b", source=source_b)
+    assert restore_live_native_sender(authority, restored_b, "admission-b").authenticated_sender is sender_b
+    assert restore_live_native_sender(authority, restored_a, "admission-a").authenticated_sender is sender_a
+    assert authority.native_sender_identities == {}
+    assert restore_live_native_sender(authority, MessageEvent(text="replay", source=source_a), "admission-a").authenticated_sender is None

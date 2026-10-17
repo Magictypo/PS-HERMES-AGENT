@@ -174,6 +174,17 @@ def pause_notice(authority, ref, reason):
             'Send /reset to start a fresh conversation, or ask the operator to resume this one.')
 
 
+def restore_live_native_sender(authority, event, admission_id):
+    """Restore only the process-local brand captured for this exact accepted FIFO row."""
+    sender = authority.native_sender_identities.pop(admission_id, None)
+    from gateway.session import is_authenticated_inbound_sender
+    if (not event.internal and is_authenticated_inbound_sender(sender)
+            and sender.platform == event.source.platform.value
+            and sender.user_id == event.source.user_id):
+        event.authenticated_sender = sender
+    return event
+
+
 def row_turn_author(policy, row):
     """Who wrote the admitted input, for memory attribution only: the producer's stamp when it
     left one, else the forwarded peer bound into the session policy; never grants anything."""
@@ -202,6 +213,9 @@ async def execute_admission(authority, ref, row):
     authority.native_waiters.discard(row['admission_id'])
     if 'native_text_v1' in row['payload']:
         event = restore_native(row['payload'], authority.runner)
+        # Restore only the process-local brand captured by _admitted for this exact live FIFO
+        # row. Durable replay, restart recovery, internal events, and mismatched sources fail closed.
+        event = restore_live_native_sender(authority, event, row['admission_id'])
     else:
         from gateway.session_ingress_media import restore_attachments
         event = MessageEvent(text=row['payload']['text'], source=live.source,

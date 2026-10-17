@@ -78,6 +78,9 @@ class SessionAuthority:
         self.waiters = {}
         self.events = {}
         self.native_waiters = set()
+        # Live, process-local sender brands keyed by committed admission ID. Never serialized;
+        # recovered/replayed queue rows intentionally have no human identity.
+        self.native_sender_identities = {}
         self.pending_results = {}
         # Replies of recovered no-waiter turns, sent only once their terminal outcome commits.
         self.pending_deliveries = {}
@@ -316,6 +319,8 @@ class SessionAuthority:
         waiting for the answer instead of reporting accepted work as a conflict."""
         for row in list_session_admissions(self.db, session_id=ref.session_id):
             admission_id = row['admission_id']
+            if reason != 'session_busy' or admission_id in self.native_waiters:
+                self.native_sender_identities.pop(admission_id, None)
             if reason == 'session_busy' and admission_id not in self.native_waiters:
                 continue
             self.native_waiters.discard(admission_id)
@@ -370,6 +375,17 @@ class SessionAuthority:
     def _admitted(self, ref, event, row):
         if event is not None:
             event._gateway_accepted = True
+            # The durable envelope deliberately strips the adapter-minted sender brand. Preserve it
+            # only for this live accepted event, keyed to its exact committed admission; never infer
+            # it from the serialized SessionSource or restore it after process restart.
+            from gateway.session import is_authenticated_inbound_sender
+            sender = getattr(event, 'authenticated_sender', None)
+            if (row.get('status') == 'queued'
+                    and not getattr(event, 'internal', False)
+                    and is_authenticated_inbound_sender(sender)
+                    and sender.platform == event.source.platform.value
+                    and sender.user_id == event.source.user_id):
+                self.native_sender_identities[row['admission_id']] = sender
         self._publish_pending(ref)
         return self._receipt(row)
 
@@ -553,6 +569,7 @@ class SessionAuthority:
         return row
 
     def _settle_cancelled(self, ref, admission_id):
+        self.native_sender_identities.pop(admission_id, None)
         # The only place a queued row becomes terminal: every observer kind that waits on
         # the admission (native delivery, API/webhook/hosted waiters, ACP and viewer streams)
         # settles here, or a cancelled row that never reaches _drain blocks them forever.
@@ -911,6 +928,10 @@ class SessionAuthority:
             import logging
             logging.getLogger(__name__).exception('Admitted turn %s failed', row['admission_id'])
             return 'The admitted turn failed.', 'failed'
+        finally:
+            # Execution can be cancelled or fail before native event reconstruction.
+            # Settlement is not guaranteed to run on those paths; discard live trust now.
+            self.native_sender_identities.pop(row['admission_id'], None)
 
     async def _drain(self, ref):
         from gateway.session_managed_worker import ManagedExecutionUnknown
@@ -1002,6 +1023,8 @@ class SessionAuthority:
                         response = captured['result'].get('final_response') or ''
                         publish_terminal(self, ref, row, settled, response, captured)
             finally:
+                # Covers failures before execute_admission consumed the in-memory sender.
+                self.native_sender_identities.pop(admission_id, None)
                 # The stamp names a claimed, unsettled execution. Left in place, idle
                 # mutations (session.updated) would carry a terminal generation and
                 # a versioned viewer fence would discard them as late frames.

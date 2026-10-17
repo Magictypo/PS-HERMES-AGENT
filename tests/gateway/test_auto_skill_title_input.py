@@ -10,7 +10,7 @@ from agent import title_generator
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource, SessionEntry
+from gateway.session import SessionSource, SessionEntry, authenticated_inbound_sender
 from gateway.turn_context import TurnContext
 from run_agent import AIAgent
 
@@ -31,8 +31,10 @@ async def test_gateway_titles_original_request_without_changing_model_input(tmp_
     monkeypatch.setattr("gateway.run._load_gateway_config", dict)
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", dict)
     source = SessionSource(platform=Platform.DISCORD, chat_id="channel", user_id="user", user_name="Example")
+    sender = authenticated_inbound_sender("discord", "user", is_human=True)
     event = MessageEvent(text=question, source=source, auto_skill=skills,
-                         channel_context="[Discord channel context: synthetic metadata]")
+                         channel_context="[Discord channel context: synthetic metadata]",
+                         authenticated_sender=sender)
     entry = SessionEntry(session_id="title-test", session_key="discord:title-test",
                          created_at=datetime(2026, 1, 1), updated_at=datetime(2026, 1, 1))
     runner = GatewayRunner.__new__(GatewayRunner)
@@ -80,6 +82,12 @@ async def test_gateway_titles_original_request_without_changing_model_input(tmp_
 
     def observe_model(agent, messages):
         model_inputs.append(messages[-1]["content"])
+        # This test uses the real _run_agent_inner -> TurnContext -> TurnRunner ->
+        # AIAgent facade -> conversation_loop prologue (no stubbed inner/runner).
+        if len(model_inputs) == 1:
+            assert agent._active_trusted_inbound_identity is sender
+        else:
+            assert agent._active_trusted_inbound_identity is None
         raise _TurnObserved
 
     monkeypatch.setattr("agent.conversation_loop.begin_iteration", observe_model)
